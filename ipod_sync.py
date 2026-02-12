@@ -372,86 +372,115 @@ class iPodSync:
             libgpod.itdb_free(itdb)
             raise RuntimeError("No master playlist found on iPod")
 
-        # --- Add unsynced tracks ---
-        unsynced = db.get_unsynced()
-        total = len(unsynced) + len(db.get_deleted())
-        done = 0
+        try:
+            # --- Phase 1: Copy new audio files ---
+            unsynced = db.get_unsynced()
+            deleted = db.get_deleted()
+            total = len(unsynced) + len(deleted)
+            done = 0
+            synced_ids = []
 
-        for row in unsynced:
-            src = row["file_path"]
-            if not os.path.isfile(src):
+            for row in unsynced:
+                src = row["file_path"]
+                if not os.path.isfile(src):
+                    done += 1
+                    continue
+
+                if progress_cb:
+                    progress_cb(done / max(total, 1), f"Copying: {row['title']}")
+
+                track = libgpod.itdb_track_new()
+                t = track[0]
+                t.title = libglib.g_strdup(row["title"].encode("utf-8"))
+                t.artist = libglib.g_strdup(row["artist"].encode("utf-8"))
+                t.album = libglib.g_strdup(row["album"].encode("utf-8"))
+                t.genre = libglib.g_strdup(row["genre"].encode("utf-8"))
+                t.filetype = libglib.g_strdup(row["filetype"].encode("utf-8"))
+                t.track_nr = row["track_nr"]
+                t.tracklen = row["duration_ms"]
+                t.bitrate = row["bitrate"] // 1000 if row["bitrate"] > 1000 else row["bitrate"]
+                t.size = row["filesize"]
+                t.mediatype = ITDB_MEDIATYPE_AUDIO
+
+                libgpod.itdb_track_add(itdb, track, -1)
+                libgpod.itdb_playlist_add_track(mpl, track, -1)
+
+                ok = libgpod.itdb_cp_track_to_ipod(track, src.encode("utf-8"), None)
+                if not ok:
+                    print(f"Warning: failed to copy {src} to iPod")
+
+                synced_ids.append(row["id"])
                 done += 1
-                continue
 
+            # --- Phase 2: Set artwork on ALL iPod tracks ---
             if progress_cb:
-                progress_cb(done / max(total, 1), f"Copying: {row['title']}")
+                progress_cb(done / max(total, 1), "Setting artwork...")
 
-            track = libgpod.itdb_track_new()
-            t = track[0]
-            t.title = libglib.g_strdup(row["title"].encode("utf-8"))
-            t.artist = libglib.g_strdup(row["artist"].encode("utf-8"))
-            t.album = libglib.g_strdup(row["album"].encode("utf-8"))
-            t.genre = libglib.g_strdup(row["genre"].encode("utf-8"))
-            t.filetype = libglib.g_strdup(row["filetype"].encode("utf-8"))
-            t.track_nr = row["track_nr"]
-            t.tracklen = row["duration_ms"]
-            t.bitrate = row["bitrate"] // 1000 if row["bitrate"] > 1000 else row["bitrate"]
-            t.size = row["filesize"]
-            t.mediatype = ITDB_MEDIATYPE_AUDIO
+            # Prefetch all iPod artwork into RAM
+            art_cache = {}
+            for art_row in db.conn.execute(
+                    "SELECT id, image_data FROM ipod_artwork").fetchall():
+                art_cache[art_row["id"]] = bytes(art_row["image_data"])
 
-            libgpod.itdb_track_add(itdb, track, -1)
-            libgpod.itdb_playlist_add_track(mpl, track, -1)
+            # Build lookup: (title, artist, album) → ipod_artwork_id
+            art_lookup = {}
+            for r in db.conn.execute(
+                    "SELECT title, artist, album, ipod_artwork_id "
+                    "FROM tracks WHERE deleted=0 AND ipod_artwork_id IS NOT NULL"
+                    ).fetchall():
+                art_lookup[(r["title"], r["artist"], r["album"])] = r["ipod_artwork_id"]
 
-            ok = libgpod.itdb_cp_track_to_ipod(track, src.encode("utf-8"), None)
-            if not ok:
-                print(f"Warning: failed to copy {src} to iPod")
-
-            # Cover art
-            cover = row["cover_art"]
-            if cover:
-                libgpod.itdb_track_set_thumbnails_from_data(
-                    track, cover, len(cover))
-
-            db.mark_synced(row["id"])
-            done += 1
-
-        # --- Remove deleted tracks from iPod ---
-        deleted = db.get_deleted()
-        # Build lookup set of (title, artist, album) to remove
-        to_remove = {(r["title"], r["artist"], r["album"]) for r in deleted}
-
-        if to_remove:
-            # Collect iPod tracks matching deleted entries
-            tracks_to_remove = []
-            for tptr in _glist_foreach(itdb[0].tracks, ctypes.POINTER(Itdb_Track)):
+            # Walk every track on iPod, re-set thumbnails from preprocessed cache
+            for tptr in _glist_foreach(itdb[0].tracks,
+                                       ctypes.POINTER(Itdb_Track)):
                 key = (_str_at(tptr[0].title),
                        _str_at(tptr[0].artist),
                        _str_at(tptr[0].album))
-                if key in to_remove:
-                    tracks_to_remove.append(tptr)
+                art_id = art_lookup.get(key)
+                if art_id and art_id in art_cache:
+                    data = art_cache[art_id]
+                    libgpod.itdb_track_set_thumbnails_from_data(
+                        tptr, data, len(data))
 
-            for tptr in tracks_to_remove:
-                if progress_cb:
-                    progress_cb(done / max(total, 1),
-                                f"Removing: {_str_at(tptr[0].title)}")
-                libgpod.itdb_playlist_remove_track(mpl, tptr)
-                libgpod.itdb_track_remove(tptr)
-                done += 1
+            # --- Phase 3: Remove deleted tracks from iPod ---
+            to_remove = {(r["title"], r["artist"], r["album"]) for r in deleted}
 
-            db.purge_deleted()
+            if to_remove:
+                tracks_to_remove = []
+                for tptr in _glist_foreach(itdb[0].tracks,
+                                           ctypes.POINTER(Itdb_Track)):
+                    key = (_str_at(tptr[0].title),
+                           _str_at(tptr[0].artist),
+                           _str_at(tptr[0].album))
+                    if key in to_remove:
+                        tracks_to_remove.append(tptr)
 
-        # --- Write and free ---
-        if progress_cb:
-            progress_cb(0.95, "Writing iPod database...")
+                for tptr in tracks_to_remove:
+                    if progress_cb:
+                        progress_cb(done / max(total, 1),
+                                    f"Removing: {_str_at(tptr[0].title)}")
+                    libgpod.itdb_playlist_remove_track(mpl, tptr)
+                    libgpod.itdb_track_remove(tptr)
+                    done += 1
 
-        ok = libgpod.itdb_write(itdb, None)
-        libgpod.itdb_free(itdb)
+                db.purge_deleted()
 
-        if not ok:
-            raise RuntimeError("Failed to write iPod database")
+            # --- Phase 4: Write iPod database ---
+            if progress_cb:
+                progress_cb(0.95, "Writing iPod database...")
 
-        if progress_cb:
-            progress_cb(1.0, "Sync complete")
+            ok = libgpod.itdb_write(itdb, None)
+            if not ok:
+                raise RuntimeError("Failed to write iPod database")
+
+            # --- Phase 5: Mark synced ONLY after successful write ---
+            if synced_ids:
+                db.mark_synced_batch(synced_ids)
+
+            if progress_cb:
+                progress_cb(1.0, "Sync complete")
+        finally:
+            libgpod.itdb_free(itdb)
 
     def eject(self, done_cb=None):
         """Eject the iPod via Gio, with udisksctl fallback."""

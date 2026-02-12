@@ -23,7 +23,7 @@ class TrackItem(GObject.Object):
     __gtype_name__ = "TrackItem"
 
     def __init__(self, track_id, title, artist, album, duration_ms,
-                 synced, file_path):
+                 synced, file_path, ipod_artwork_id=None):
         super().__init__()
         self.track_id = track_id
         self.title = title or ""
@@ -32,6 +32,7 @@ class TrackItem(GObject.Object):
         self.duration_ms = duration_ms or 0
         self.synced = bool(synced)
         self.file_path = file_path or ""
+        self.ipod_artwork_id = ipod_artwork_id
 
 
 def _format_duration(ms):
@@ -51,7 +52,8 @@ class IPodManagerWindow(Gtk.ApplicationWindow):
         self._active_playlist_id = None  # None = "All", else DB playlist id
         self._all_tracks = []            # [TrackItem, ...] loaded once
         self._playlist_members = {}      # {playlist_id: set(track_ids)}
-        self._art_cache = {}             # {(artist, album): Gdk.Texture}
+        self._art_cache = {}             # {track_id: Gdk.Texture}
+        self._ipod_art_cache = {}        # {ipod_artwork_id: Gdk.Texture}
         self._no_art_texture = self._make_placeholder_texture()
 
         self._build_ui()
@@ -68,7 +70,8 @@ class IPodManagerWindow(Gtk.ApplicationWindow):
     def _load_data(self):
         """Load all tracks and playlist memberships into memory."""
         rows = self.db.conn.execute(
-            "SELECT id, file_path, title, artist, album, duration_ms, synced "
+            "SELECT id, file_path, title, artist, album, duration_ms, synced, "
+            "ipod_artwork_id "
             "FROM tracks WHERE deleted=0 ORDER BY artist, album, track_nr"
         ).fetchall()
         self._all_tracks = [
@@ -76,6 +79,7 @@ class IPodManagerWindow(Gtk.ApplicationWindow):
                 track_id=r["id"], title=r["title"], artist=r["artist"],
                 album=r["album"], duration_ms=r["duration_ms"],
                 synced=r["synced"], file_path=r["file_path"],
+                ipod_artwork_id=r["ipod_artwork_id"],
             )
             for r in rows
         ]
@@ -117,18 +121,19 @@ class IPodManagerWindow(Gtk.ApplicationWindow):
         threading.Thread(target=self._art_worker, daemon=True).start()
 
     def _art_worker(self):
-        """Background: load one cover_art per unique album, decode in parallel."""
+        """Background: load cover_art + iPod artwork, decode in parallel."""
         conn = sqlite3.connect(str(self.db.db_path))
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """SELECT id, cover_art FROM tracks
                WHERE deleted=0 AND cover_art IS NOT NULL"""
         ).fetchall()
+        ipod_rows = conn.execute(
+            "SELECT id, image_data FROM ipod_artwork"
+        ).fetchall()
         conn.close()
 
         to_decode = [r for r in rows if r["id"] not in self._art_cache]
-        if not to_decode:
-            return
 
         def decode(row):
             try:
@@ -147,13 +152,35 @@ class IPodManagerWindow(Gtk.ApplicationWindow):
                 if pixbuf:
                     results.append((key, pixbuf))
 
-        if results:
-            GLib.idle_add(self._apply_art, results)
+        ipod_to_decode = [r for r in ipod_rows if r["id"] not in self._ipod_art_cache]
 
-    def _apply_art(self, results):
+        def decode_ipod(row):
+            try:
+                loader = GdkPixbuf.PixbufLoader()
+                loader.write(bytes(row["image_data"]))
+                loader.close()
+                pb = loader.get_pixbuf()
+                return (row["id"],
+                        pb.scale_simple(36, 36, GdkPixbuf.InterpType.BILINEAR))
+            except Exception:
+                return None, None
+
+        ipod_results = []
+        with ThreadPoolExecutor() as pool:
+            for key, pixbuf in pool.map(decode_ipod, ipod_to_decode):
+                if pixbuf:
+                    ipod_results.append((key, pixbuf))
+
+        if results or ipod_results:
+            GLib.idle_add(self._apply_art, results, ipod_results)
+
+    def _apply_art(self, results, ipod_results=None):
         """Main thread: create textures and refresh visible rows."""
         for track_id, pixbuf in results:
             self._art_cache[track_id] = Gdk.Texture.new_for_pixbuf(pixbuf)
+        if ipod_results:
+            for art_id, pixbuf in ipod_results:
+                self._ipod_art_cache[art_id] = Gdk.Texture.new_for_pixbuf(pixbuf)
         self._refresh_list()
         return False
 
@@ -270,6 +297,7 @@ class IPodManagerWindow(Gtk.ApplicationWindow):
         scroll.set_child(self.column_view)
 
         self.column_view.append_column(self._make_art_column())
+        self.column_view.append_column(self._make_ipod_art_column())
         self.column_view.append_column(
             self._make_label_column("Title", self._bind_title))
         self.column_view.append_column(
@@ -337,6 +365,14 @@ class IPodManagerWindow(Gtk.ApplicationWindow):
         col.set_fixed_width(44)
         return col
 
+    def _make_ipod_art_column(self):
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", self._setup_picture)
+        factory.connect("bind", self._bind_ipod_art)
+        col = Gtk.ColumnViewColumn(title="iPod", factory=factory)
+        col.set_fixed_width(44)
+        return col
+
     def _make_synced_column(self):
         factory = Gtk.SignalListItemFactory()
         factory.connect("setup", self._setup_image)
@@ -388,6 +424,14 @@ class IPodManagerWindow(Gtk.ApplicationWindow):
         pic = list_item.get_child()
         texture = self._art_cache.get(item.track_id)
         pic.set_paintable(texture or self._no_art_texture)
+
+    def _bind_ipod_art(self, _factory, list_item):
+        item = list_item.get_item()
+        pic = list_item.get_child()
+        texture = None
+        if item.ipod_artwork_id:
+            texture = self._ipod_art_cache.get(item.ipod_artwork_id)
+        pic.set_paintable(texture)
 
     @staticmethod
     def _bind_synced(_factory, list_item):

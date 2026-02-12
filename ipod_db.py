@@ -1,6 +1,8 @@
 """Local music library database backed by SQLite + mutagen metadata extraction."""
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 import sqlite3
 import subprocess
@@ -13,6 +15,7 @@ import mutagen
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
 from mutagen.id3 import ID3
+from PIL import Image, ImageOps
 
 
 DB_DIR = Path.home() / ".local" / "share" / "ipod-manager"
@@ -21,6 +24,32 @@ CONVERT_DIR = DB_DIR / "converted"
 QL_PLAYLISTS = Path.home() / ".config" / "quodlibet" / "playlists"
 IPOD_FORMATS = {".mp3", ".m4a", ".aac", ".wav", ".aiff"}
 XSPF_NS = {"x": "http://xspf.org/ns/0/"}
+
+
+def _album_key(artist: str, album: str) -> str:
+    """Canonical key for deduplicating artwork per album."""
+    return artist.strip().lower() + "\x00" + album.strip().lower()
+
+
+def _preprocess_artwork(raw_bytes: bytes) -> bytes:
+    """Convert raw cover art to a 600x600 baseline JPEG optimized for iPod."""
+    img = Image.open(io.BytesIO(raw_bytes))
+    img = ImageOps.exif_transpose(img)
+    if img.mode not in ("RGB",):
+        img = img.convert("RGB")
+    # Center-crop to square
+    w, h = img.size
+    side = min(w, h)
+    left = (w - side) // 2
+    top = (h - side) // 2
+    img = img.crop((left, top, left + side, top + side))
+    # Resize to 600x600 max
+    if side > 600:
+        img = img.resize((600, 600), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85, progressive=False)
+    return buf.getvalue()
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tracks (
@@ -49,6 +78,13 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
     track_id    INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
     position    INTEGER DEFAULT 0,
     PRIMARY KEY (playlist_id, track_id)
+);
+
+CREATE TABLE IF NOT EXISTS ipod_artwork (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    album_key  TEXT UNIQUE NOT NULL,
+    image_hash TEXT NOT NULL,
+    image_data BLOB NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tracks_deleted_synced ON tracks(deleted, synced);
@@ -229,7 +265,101 @@ class LibraryDB:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
-        self.backfill_cover_art()
+        self._migrate_schema()
+        self.backfill_artwork()
+
+    def _migrate_schema(self):
+        """Add ipod_artwork_id column to tracks if missing."""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(tracks)").fetchall()}
+        if "ipod_artwork_id" not in cols:
+            self.conn.execute(
+                "ALTER TABLE tracks ADD COLUMN ipod_artwork_id INTEGER "
+                "REFERENCES ipod_artwork(id)")
+            self.conn.commit()
+            self._backfill_ipod_artwork()
+
+    def _backfill_ipod_artwork(self):
+        """One-time migration: generate iPod artwork for all existing albums."""
+        reps = self.conn.execute(
+            "SELECT MIN(id) as rep_id, artist, album FROM tracks "
+            "WHERE cover_art IS NOT NULL AND deleted=0 "
+            "GROUP BY artist, album"
+        ).fetchall()
+        if not reps:
+            return
+        # Fetch cover_art blobs for representative tracks
+        rep_ids = [r["rep_id"] for r in reps]
+        placeholders = ",".join("?" * len(rep_ids))
+        art_rows = self.conn.execute(
+            f"SELECT id, cover_art FROM tracks WHERE id IN ({placeholders})",
+            rep_ids).fetchall()
+        art_by_id = {r["id"]: r["cover_art"] for r in art_rows}
+
+        # Build work items: (album_key, hash, raw_bytes)
+        work = []
+        for r in reps:
+            raw = art_by_id.get(r["rep_id"])
+            if not raw:
+                continue
+            key = _album_key(r["artist"], r["album"])
+            h = hashlib.sha256(raw).hexdigest()
+            work.append((key, h, raw, r["artist"], r["album"]))
+
+        # Parallel preprocessing
+        workers = min(os.cpu_count() or 4, len(work))
+        processed = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_preprocess_artwork, w[2]): w for w in work}
+            for fut in as_completed(futures):
+                w = futures[fut]
+                try:
+                    processed[w[0]] = (w[0], w[1], fut.result())
+                except Exception:
+                    continue
+
+        # Batch insert into ipod_artwork
+        insert_data = [(p[0], p[1], p[2]) for p in processed.values()]
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO ipod_artwork (album_key, image_hash, image_data) "
+            "VALUES (?,?,?)", insert_data)
+
+        # Build album_key → ipod_artwork.id mapping
+        all_art = self.conn.execute("SELECT id, album_key FROM ipod_artwork").fetchall()
+        key_to_id = {r["album_key"]: r["id"] for r in all_art}
+
+        # Batch update tracks
+        update_data = []
+        for w in work:
+            art_id = key_to_id.get(w[0])
+            if art_id:
+                update_data.append((art_id, w[3], w[4]))
+        self.conn.executemany(
+            "UPDATE tracks SET ipod_artwork_id=? WHERE artist=? AND album=?",
+            update_data)
+        self.conn.commit()
+
+    def _get_or_create_ipod_artwork(self, artist: str, album: str, raw_data: bytes) -> int:
+        """Get or create iPod-optimized artwork for an album. Returns ipod_artwork.id."""
+        key = _album_key(artist, album)
+        h = hashlib.sha256(raw_data).hexdigest()
+        row = self.conn.execute(
+            "SELECT id, image_hash FROM ipod_artwork WHERE album_key=?", (key,)
+        ).fetchone()
+        if row:
+            if row["image_hash"] == h:
+                return row["id"]
+            # Art changed — reprocess and update
+            processed = _preprocess_artwork(raw_data)
+            self.conn.execute(
+                "UPDATE ipod_artwork SET image_hash=?, image_data=? WHERE id=?",
+                (h, processed, row["id"]))
+            return row["id"]
+        # New album art
+        processed = _preprocess_artwork(raw_data)
+        cur = self.conn.execute(
+            "INSERT INTO ipod_artwork (album_key, image_hash, image_data) VALUES (?,?,?)",
+            (key, h, processed))
+        return cur.lastrowid
 
     def add_track(self, file_path: str) -> int | None:
         """Extract metadata and insert. Returns row id, or None if duplicate."""
@@ -245,8 +375,14 @@ class LibraryDB:
                  meta["bitrate"], meta["filesize"], meta["cover_art"],
                  meta["filetype"]),
             )
+            track_id = cur.lastrowid
+            if meta["cover_art"]:
+                art_id = self._get_or_create_ipod_artwork(
+                    meta["artist"], meta["album"], meta["cover_art"])
+                self.conn.execute(
+                    "UPDATE tracks SET ipod_artwork_id=? WHERE id=?", (art_id, track_id))
             self.conn.commit()
-            return cur.lastrowid
+            return track_id
         except sqlite3.IntegrityError:
             return None
 
@@ -263,8 +399,14 @@ class LibraryDB:
                  meta["bitrate"], meta["filesize"], meta["cover_art"],
                  meta["filetype"]),
             )
+            track_id = cur.lastrowid
+            if meta.get("cover_art"):
+                art_id = self._get_or_create_ipod_artwork(
+                    meta["artist"], meta["album"], meta["cover_art"])
+                self.conn.execute(
+                    "UPDATE tracks SET ipod_artwork_id=? WHERE id=?", (art_id, track_id))
             self.conn.commit()
-            return cur.lastrowid
+            return track_id
         except sqlite3.IntegrityError:
             return None
 
@@ -320,8 +462,16 @@ class LibraryDB:
         self.conn.execute("UPDATE tracks SET synced=1 WHERE id=?", (track_id,))
         self.conn.commit()
 
-    def backfill_cover_art(self):
-        """Re-extract cover art for tracks that have none in the DB."""
+    def mark_synced_batch(self, track_ids: list[int]):
+        """Mark multiple tracks as synced in a single transaction."""
+        self.conn.executemany(
+            "UPDATE tracks SET synced=1 WHERE id=?",
+            [(tid,) for tid in track_ids])
+        self.conn.commit()
+
+    def backfill_artwork(self):
+        """Re-extract cover art for tracks missing it, then derive iPod artwork."""
+        # Phase 1: backfill cover_art from source files
         rows = self.conn.execute(
             "SELECT id, file_path FROM tracks WHERE cover_art IS NULL AND deleted=0"
         ).fetchall()
@@ -335,6 +485,27 @@ class LibraryDB:
                     (meta["cover_art"], row["id"]))
         if rows:
             self.conn.commit()
+
+        # Phase 2: derive iPod artwork for tracks missing ipod_artwork_id
+        need_art = self.conn.execute(
+            "SELECT id, artist, album, cover_art FROM tracks "
+            "WHERE ipod_artwork_id IS NULL AND cover_art IS NOT NULL AND deleted=0"
+        ).fetchall()
+        if not need_art:
+            return
+        # Deduplicate by album — only process once per unique (artist, album)
+        seen_keys = {}
+        update_data = []
+        for row in need_art:
+            key = _album_key(row["artist"], row["album"])
+            if key not in seen_keys:
+                art_id = self._get_or_create_ipod_artwork(
+                    row["artist"], row["album"], row["cover_art"])
+                seen_keys[key] = art_id
+            update_data.append((seen_keys[key], row["id"]))
+        self.conn.executemany(
+            "UPDATE tracks SET ipod_artwork_id=? WHERE id=?", update_data)
+        self.conn.commit()
 
     def purge_deleted(self):
         """Remove soft-deleted tracks that have been un-synced from iPod."""
