@@ -1,6 +1,6 @@
 # ipod-manager
 
-![screenshot](docs/screenshot.png)
+![screenshot](screenshot.png)
 
 GTK4 music manager for iPod Classic. Add tracks, import playlists, sync to your iPod. It works.
 
