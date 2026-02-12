@@ -35,6 +35,8 @@ class TrackItem(GObject.Object):
         self.ipod_artwork_id = ipod_artwork_id
 
 
+SHOW_ORIGINAL_ART = False
+
 def _format_duration(ms):
     s = ms // 1000
     return f"{s // 60}:{s % 60:02d}"
@@ -296,7 +298,8 @@ class IPodManagerWindow(Gtk.ApplicationWindow):
         self.column_view.add_css_class("data-table")
         scroll.set_child(self.column_view)
 
-        self.column_view.append_column(self._make_art_column())
+        if SHOW_ORIGINAL_ART:
+            self.column_view.append_column(self._make_art_column())
         self.column_view.append_column(self._make_ipod_art_column())
         self.column_view.append_column(
             self._make_label_column("Title", self._bind_title))
@@ -369,7 +372,7 @@ class IPodManagerWindow(Gtk.ApplicationWindow):
         factory = Gtk.SignalListItemFactory()
         factory.connect("setup", self._setup_picture)
         factory.connect("bind", self._bind_ipod_art)
-        col = Gtk.ColumnViewColumn(title="iPod", factory=factory)
+        col = Gtk.ColumnViewColumn(title="", factory=factory)
         col.set_fixed_width(44)
         return col
 
