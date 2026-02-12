@@ -93,6 +93,39 @@ CREATE INDEX IF NOT EXISTS idx_playlist_tracks_track_id ON playlist_tracks(track
 """
 
 
+def _find_folder_art(audio_path: Path, album: str) -> bytes | None:
+    """Look for cover art files next to the audio file.
+
+    Checks for cover.jpg/png and [album-name].jpg/png in the same directory.
+    Returns raw image bytes or None.
+    """
+    folder = audio_path.parent
+    candidates = ["cover.jpg", "cover.png"]
+    if album:
+        album_lower = album.strip().lower()
+        candidates.extend([f"{album_lower}.jpg", f"{album_lower}.png"])
+    for name in candidates:
+        art_path = folder / name
+        if art_path.is_file():
+            try:
+                return art_path.read_bytes()
+            except OSError:
+                continue
+    # Case-insensitive fallback
+    try:
+        files = {f.name.lower(): f for f in folder.iterdir() if f.is_file()}
+    except OSError:
+        return None
+    for name in candidates:
+        match = files.get(name.lower())
+        if match:
+            try:
+                return match.read_bytes()
+            except OSError:
+                continue
+    return None
+
+
 def extract_metadata(file_path: str) -> dict:
     """Read tags from an MP3 or M4A file. Returns a dict ready for DB insertion."""
     path = Path(file_path)
@@ -155,6 +188,10 @@ def extract_metadata(file_path: str) -> dict:
             covr = t.get("covr")
             if covr:
                 meta["cover_art"] = bytes(covr[0])
+
+    # Fallback: look for cover art file next to the audio file
+    if meta["cover_art"] is None:
+        meta["cover_art"] = _find_folder_art(path, meta["album"])
 
     return meta
 
