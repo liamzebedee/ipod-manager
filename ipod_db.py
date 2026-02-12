@@ -1,10 +1,11 @@
 """Local music library database backed by SQLite + mutagen metadata extraction."""
+from __future__ import annotations
 
 import os
 import sqlite3
 import subprocess
 import xml.etree.ElementTree as ET
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -39,6 +40,20 @@ CREATE TABLE IF NOT EXISTS tracks (
     added_at    TEXT DEFAULT (datetime('now')),
     filetype    TEXT DEFAULT 'mp3'
 );
+CREATE TABLE IF NOT EXISTS playlists (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL
+);
+CREATE TABLE IF NOT EXISTS playlist_tracks (
+    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    track_id    INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    position    INTEGER DEFAULT 0,
+    PRIMARY KEY (playlist_id, track_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tracks_deleted_synced ON tracks(deleted, synced);
+CREATE INDEX IF NOT EXISTS idx_tracks_artist_album_track ON tracks(artist, album, track_nr);
+CREATE INDEX IF NOT EXISTS idx_playlist_tracks_track_id ON playlist_tracks(track_id);
 """
 
 
@@ -105,33 +120,7 @@ def extract_metadata(file_path: str) -> dict:
             if covr:
                 meta["cover_art"] = bytes(covr[0])
 
-    # Fallback: look for folder art if no embedded cover
-    if meta["cover_art"] is None:
-        meta["cover_art"] = _find_folder_art(path.parent)
-
     return meta
-
-
-_ART_NAMES = ("cover", "folder", "front", "album", "art", "artwork")
-_ART_EXTS = (".jpg", ".jpeg", ".png")
-
-
-def _find_folder_art(directory: Path) -> bytes | None:
-    """Look for cover art image files in the same directory."""
-    for f in directory.iterdir():
-        if f.suffix.lower() in _ART_EXTS and f.stem.lower() in _ART_NAMES:
-            try:
-                return f.read_bytes()
-            except OSError:
-                pass
-    # If no standard name, try any image whose name contains album-ish keywords
-    for f in directory.iterdir():
-        if f.suffix.lower() in _ART_EXTS:
-            try:
-                return f.read_bytes()
-            except OSError:
-                pass
-    return None
 
 
 def _convert_one(src: str) -> tuple[str, str | None]:
@@ -152,11 +141,6 @@ def _convert_one(src: str) -> tuple[str, str | None]:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return src, None
 
-    # Embed cover art via mutagen
-    art_data = _find_folder_art(Path(src).parent)
-    if art_data:
-        _embed_cover_art(str(dest), art_data)
-
     return src, str(dest)
 
 
@@ -166,11 +150,8 @@ def convert_to_mp3(src: str, progress_cb=None) -> str | None:
     return result
 
 
-_MAX_WORKERS = min(os.cpu_count() or 4, 8)
-
-
 def convert_batch(sources: list[str], progress_cb=None) -> dict[str, str | None]:
-    """Convert multiple files to MP3 in parallel.
+    """Convert multiple files to MP3 in parallel using all CPU cores.
     Returns {src_path: dest_path_or_None}.
     progress_cb(done, total, filename) is called as each finishes."""
     CONVERT_DIR.mkdir(parents=True, exist_ok=True)
@@ -190,8 +171,9 @@ def convert_batch(sources: list[str], progress_cb=None) -> dict[str, str | None]
 
     done = len(results)
     total = len(sources)
+    workers = os.cpu_count() or 4
 
-    with ProcessPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_convert_one, src): src for src in to_convert}
         for future in as_completed(futures):
             src, dest = future.result()
@@ -201,18 +183,6 @@ def convert_batch(sources: list[str], progress_cb=None) -> dict[str, str | None]
                 progress_cb(done, total, Path(src).name)
 
     return results
-
-
-def _embed_cover_art(mp3_path: str, art_data: bytes):
-    """Embed cover art into an MP3 file via mutagen."""
-    from mutagen.id3 import APIC
-    try:
-        tags = ID3(mp3_path)
-    except Exception:
-        return
-    mime = "image/png" if art_data[:8] == b'\x89PNG\r\n\x1a\n' else "image/jpeg"
-    tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=art_data))
-    tags.save(mp3_path)
 
 
 def discover_ql_playlists() -> list[dict]:
@@ -256,12 +226,32 @@ class LibraryDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute(SCHEMA)
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self.backfill_cover_art()
 
     def add_track(self, file_path: str) -> int | None:
         """Extract metadata and insert. Returns row id, or None if duplicate."""
         meta = extract_metadata(file_path)
+        try:
+            cur = self.conn.execute(
+                """INSERT INTO tracks
+                   (file_path, title, artist, album, genre, track_nr,
+                    duration_ms, bitrate, filesize, cover_art, filetype)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (meta["file_path"], meta["title"], meta["artist"], meta["album"],
+                 meta["genre"], meta["track_nr"], meta["duration_ms"],
+                 meta["bitrate"], meta["filesize"], meta["cover_art"],
+                 meta["filetype"]),
+            )
+            self.conn.commit()
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            return None
+
+    def add_track_from_meta(self, meta: dict) -> int | None:
+        """Insert a track from pre-extracted metadata. Returns row id or None."""
         try:
             cur = self.conn.execute(
                 """INSERT INTO tracks
@@ -283,10 +273,38 @@ class LibraryDB:
         self.conn.execute("UPDATE tracks SET deleted=1 WHERE id=?", (track_id,))
         self.conn.commit()
 
+    def get_or_create_playlist(self, name: str) -> int:
+        """Return playlist id, creating if needed."""
+        row = self.conn.execute(
+            "SELECT id FROM playlists WHERE name=?", (name,)).fetchone()
+        if row:
+            return row["id"]
+        cur = self.conn.execute(
+            "INSERT INTO playlists (name) VALUES (?)", (name,))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def add_track_to_playlist(self, playlist_id: int, track_id: int, position: int = 0):
+        try:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) "
+                "VALUES (?,?,?)", (playlist_id, track_id, position))
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            pass
+
     def get_all_tracks(self) -> list[sqlite3.Row]:
         return self.conn.execute(
             "SELECT * FROM tracks WHERE deleted=0 ORDER BY artist, album, track_nr"
         ).fetchall()
+
+    def get_playlist_tracks(self, playlist_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT t.* FROM tracks t
+               JOIN playlist_tracks pt ON pt.track_id = t.id
+               WHERE pt.playlist_id = ? AND t.deleted = 0
+               ORDER BY pt.position, t.artist, t.album, t.track_nr""",
+            (playlist_id,)).fetchall()
 
     def get_unsynced(self) -> list[sqlite3.Row]:
         return self.conn.execute(
@@ -301,6 +319,22 @@ class LibraryDB:
     def mark_synced(self, track_id: int):
         self.conn.execute("UPDATE tracks SET synced=1 WHERE id=?", (track_id,))
         self.conn.commit()
+
+    def backfill_cover_art(self):
+        """Re-extract cover art for tracks that have none in the DB."""
+        rows = self.conn.execute(
+            "SELECT id, file_path FROM tracks WHERE cover_art IS NULL AND deleted=0"
+        ).fetchall()
+        for row in rows:
+            if not Path(row["file_path"]).exists():
+                continue
+            meta = extract_metadata(row["file_path"])
+            if meta["cover_art"] is not None:
+                self.conn.execute(
+                    "UPDATE tracks SET cover_art=? WHERE id=?",
+                    (meta["cover_art"], row["id"]))
+        if rows:
+            self.conn.commit()
 
     def purge_deleted(self):
         """Remove soft-deleted tracks that have been un-synced from iPod."""
