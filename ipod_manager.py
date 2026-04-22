@@ -527,6 +527,9 @@ class IPodManagerWindow(Gtk.ApplicationWindow):
 
         # Create playlist in DB on main thread before spawning worker
         pl_db_id = self.db.get_or_create_playlist(pl["name"])
+        self.db.conn.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id=?", (pl_db_id,))
+        self.db.conn.commit()
 
         thread = threading.Thread(
             target=self._import_worker, args=(pl, pl_idx, pl_db_id), daemon=True)
@@ -615,7 +618,7 @@ class IPodManagerWindow(Gtk.ApplicationWindow):
         self._load_data()
         self._refresh_list()
         self._load_art_background()
-        self.lbl_status.set_label(f"Imported from '{name}' ({count} tracks)")
+        self.lbl_status.set_label(f"Synced '{name}' ({count} tracks)")
         return False
 
     def _on_remove_clicked(self, _btn):

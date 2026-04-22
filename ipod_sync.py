@@ -48,6 +48,7 @@ GList._fields_ = [
 class Itdb_iTunesDB(ctypes.Structure):
     _fields_ = [
         ("tracks", ctypes.POINTER(GList)),
+        ("playlists", ctypes.POINTER(GList)),
     ]
 
 
@@ -203,13 +204,25 @@ libgpod.itdb_playlist_remove_track.restype = None
 libgpod.itdb_track_remove.argtypes = (ctypes.POINTER(Itdb_Track),)
 libgpod.itdb_track_remove.restype = None
 
+libgpod.itdb_playlist_new.argtypes = (ctypes.c_char_p, gboolean)
+libgpod.itdb_playlist_new.restype = ctypes.POINTER(Itdb_Playlist)
+
+libgpod.itdb_playlist_add.argtypes = (ctypes.POINTER(Itdb_iTunesDB),
+                                       ctypes.POINTER(Itdb_Playlist), ctypes.c_int32)
+libgpod.itdb_playlist_add.restype = None
+
+libgpod.itdb_playlist_remove.argtypes = (ctypes.POINTER(Itdb_Playlist),)
+libgpod.itdb_playlist_remove.restype = None
+
 libgpod.itdb_write.argtypes = (ctypes.POINTER(Itdb_iTunesDB), ctypes.c_void_p)
 libgpod.itdb_write.restype = gboolean
 
 libgpod.itdb_free.argtypes = (ctypes.POINTER(Itdb_iTunesDB),)
 libgpod.itdb_free.restype = None
 
-ITDB_MEDIATYPE_AUDIO = 1
+ITDB_MEDIATYPE_AUDIO = 0x0001
+ITDB_MEDIATYPE_PODCAST = 0x0004
+ITDB_MEDIATYPE_AUDIOBOOK = 0x0008
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +386,32 @@ class iPodSync:
             raise RuntimeError("No master playlist found on iPod")
 
         try:
+            # --- Build mediatype lookup from playlists ---
+            # track_id → flags based on playlist membership
+            skip_shuffle_ids = set()  # tracks that should skip when shuffling
+            podcast_ids = set()       # tracks that are podcasts
+            for r in db.conn.execute(
+                    """SELECT p.name, pt.track_id FROM playlists p
+                       JOIN playlist_tracks pt ON pt.playlist_id = p.id"""
+                    ).fetchall():
+                name = r["name"].strip().lower()
+                if name == "audiobooks":
+                    skip_shuffle_ids.add(r["track_id"])
+                elif name == "podcasts":
+                    podcast_ids.add(r["track_id"])
+                    skip_shuffle_ids.add(r["track_id"])
+
+            # Build (title, artist, album) → (mediatype, skip_shuffle)
+            track_flags = {}
+            for r in db.conn.execute(
+                    "SELECT id, title, artist, album FROM tracks WHERE deleted=0"
+                    ).fetchall():
+                key = (r["title"], r["artist"], r["album"])
+                if r["id"] in podcast_ids:
+                    track_flags[key] = (ITDB_MEDIATYPE_PODCAST, True)
+                else:
+                    track_flags[key] = (ITDB_MEDIATYPE_AUDIO, r["id"] in skip_shuffle_ids)
+
             # --- Phase 1: Copy new audio files ---
             unsynced = db.get_unsynced()
             deleted = db.get_deleted()
@@ -389,6 +428,9 @@ class iPodSync:
                 if progress_cb:
                     progress_cb(done / max(total, 1), f"Copying: {row['title']}")
 
+                tid = row["id"]
+                mt = ITDB_MEDIATYPE_PODCAST if tid in podcast_ids else ITDB_MEDIATYPE_AUDIO
+
                 track = libgpod.itdb_track_new()
                 t = track[0]
                 t.title = libglib.g_strdup(row["title"].encode("utf-8"))
@@ -400,7 +442,9 @@ class iPodSync:
                 t.tracklen = row["duration_ms"]
                 t.bitrate = row["bitrate"] // 1000 if row["bitrate"] > 1000 else row["bitrate"]
                 t.size = row["filesize"]
-                t.mediatype = ITDB_MEDIATYPE_AUDIO
+                t.mediatype = mt
+                if tid in skip_shuffle_ids:
+                    t.skip_when_shuffling = 1
 
                 libgpod.itdb_track_add(itdb, track, -1)
                 libgpod.itdb_playlist_add_track(mpl, track, -1)
@@ -412,9 +456,9 @@ class iPodSync:
                 synced_ids.append(row["id"])
                 done += 1
 
-            # --- Phase 2: Set artwork on ALL iPod tracks ---
+            # --- Phase 2: Set artwork + mediatype on ALL iPod tracks ---
             if progress_cb:
-                progress_cb(done / max(total, 1), "Setting artwork...")
+                progress_cb(done / max(total, 1), "Updating artwork & metadata...")
 
             # Prefetch all iPod artwork into RAM
             art_cache = {}
@@ -430,17 +474,23 @@ class iPodSync:
                     ).fetchall():
                 art_lookup[(r["title"], r["artist"], r["album"])] = r["ipod_artwork_id"]
 
-            # Walk every track on iPod, re-set thumbnails from preprocessed cache
+            # Walk every track on iPod, update artwork + mediatype
             for tptr in _glist_foreach(itdb[0].tracks,
                                        ctypes.POINTER(Itdb_Track)):
                 key = (_str_at(tptr[0].title),
                        _str_at(tptr[0].artist),
                        _str_at(tptr[0].album))
+                # Artwork
                 art_id = art_lookup.get(key)
                 if art_id and art_id in art_cache:
                     data = art_cache[art_id]
                     libgpod.itdb_track_set_thumbnails_from_data(
                         tptr, data, len(data))
+                # Mediatype + flags
+                flags = track_flags.get(key, (ITDB_MEDIATYPE_AUDIO, False))
+                tptr[0].mediatype = flags[0]
+                tptr[0].skip_when_shuffling = 1 if flags[1] else 0
+                tptr[0].remember_playback_position = 0
 
             # --- Phase 3: Remove deleted tracks from iPod ---
             to_remove = {(r["title"], r["artist"], r["album"]) for r in deleted}
@@ -465,7 +515,50 @@ class iPodSync:
 
                 db.purge_deleted()
 
-            # --- Phase 4: Write iPod database ---
+            # --- Phase 4: Sync playlists to iPod ---
+            if progress_cb:
+                progress_cb(0.85, "Syncing playlists...")
+
+            # Remove all non-master playlists from iPod
+            old_playlists = []
+            for pptr in _glist_foreach(itdb[0].playlists,
+                                       ctypes.POINTER(Itdb_Playlist)):
+                if pptr[0].type != 1:  # type 1 = master playlist
+                    old_playlists.append(pptr)
+            for pptr in old_playlists:
+                libgpod.itdb_playlist_remove(pptr)
+
+            # Build (title, artist, album) → iPod track pointer lookup
+            ipod_track_by_key = {}
+            for tptr in _glist_foreach(itdb[0].tracks,
+                                       ctypes.POINTER(Itdb_Track)):
+                key = (_str_at(tptr[0].title),
+                       _str_at(tptr[0].artist),
+                       _str_at(tptr[0].album))
+                ipod_track_by_key[key] = tptr
+
+            # Get all local playlists with their tracks
+            local_playlists = db.conn.execute(
+                "SELECT id, name FROM playlists ORDER BY name"
+            ).fetchall()
+
+            for pl in local_playlists:
+                pl_tracks = db.get_playlist_tracks(pl["id"])
+                if not pl_tracks:
+                    continue
+
+                # Create iPod playlist
+                new_pl = libgpod.itdb_playlist_new(pl["name"].encode("utf-8"), 0)
+                libgpod.itdb_playlist_add(itdb, new_pl, -1)
+
+                # Add matching tracks
+                for t in pl_tracks:
+                    key = (t["title"], t["artist"], t["album"])
+                    tptr = ipod_track_by_key.get(key)
+                    if tptr:
+                        libgpod.itdb_playlist_add_track(new_pl, tptr, -1)
+
+            # --- Phase 5: Write iPod database ---
             if progress_cb:
                 progress_cb(0.95, "Writing iPod database...")
 
@@ -473,7 +566,7 @@ class iPodSync:
             if not ok:
                 raise RuntimeError("Failed to write iPod database")
 
-            # --- Phase 5: Mark synced ONLY after successful write ---
+            # --- Phase 6: Mark synced ONLY after successful write ---
             if synced_ids:
                 db.mark_synced_batch(synced_ids)
 

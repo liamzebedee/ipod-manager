@@ -6,6 +6,7 @@ import io
 import os
 import sqlite3
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -31,9 +32,17 @@ def _album_key(artist: str, album: str) -> str:
     return artist.strip().lower() + "\x00" + album.strip().lower()
 
 
-def _preprocess_artwork(raw_bytes: bytes) -> bytes:
-    """Convert raw cover art to a 600x600 baseline JPEG optimized for iPod."""
-    img = Image.open(io.BytesIO(raw_bytes))
+def _preprocess_artwork(raw_bytes: bytes) -> bytes | None:
+    """Convert raw cover art to a 600x600 baseline JPEG optimized for iPod.
+
+    Returns None if the bytes aren't a recognizable image.
+    """
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        img.load()
+    except Exception as e:
+        print(f"[artwork] skipping unrecognizable image ({e})", file=sys.stderr)
+        return None
     img = ImageOps.exif_transpose(img)
     if img.mode not in ("RGB",):
         img = img.convert("RGB")
@@ -387,12 +396,16 @@ class LibraryDB:
                 return row["id"]
             # Art changed — reprocess and update
             processed = _preprocess_artwork(raw_data)
+            if processed is None:
+                return row["id"]
             self.conn.execute(
                 "UPDATE ipod_artwork SET image_hash=?, image_data=? WHERE id=?",
                 (h, processed, row["id"]))
             return row["id"]
         # New album art
         processed = _preprocess_artwork(raw_data)
+        if processed is None:
+            return None
         cur = self.conn.execute(
             "INSERT INTO ipod_artwork (album_key, image_hash, image_data) VALUES (?,?,?)",
             (key, h, processed))
@@ -539,6 +552,8 @@ class LibraryDB:
                 art_id = self._get_or_create_ipod_artwork(
                     row["artist"], row["album"], row["cover_art"])
                 seen_keys[key] = art_id
+            if seen_keys[key] is None:
+                continue
             update_data.append((seen_keys[key], row["id"]))
         self.conn.executemany(
             "UPDATE tracks SET ipod_artwork_id=? WHERE id=?", update_data)

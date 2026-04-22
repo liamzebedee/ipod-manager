@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- iPod body -->
+  <rect x="48" y="16" width="160" height="224" rx="20" ry="20" fill="#e8e8e8" stroke="#b0b0b0" stroke-width="3"/>
+
+  <!-- Screen bezel -->
+  <rect x="68" y="36" width="120" height="80" rx="6" ry="6" fill="#1a1a2e"/>
+
+  <!-- Screen content - gradient background -->
+  <defs>
+    <linearGradient id="screenGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4a90d9"/>
+      <stop offset="100%" stop-color="#2c5f9e"/>
+    </linearGradient>
+  </defs>
+  <rect x="72" y="40" width="112" height="72" rx="3" ry="3" fill="url(#screenGrad)"/>
+
+  <!-- Music note on screen -->
+  <g transform="translate(116, 58)" fill="white" opacity="0.95">
+    <ellipse cx="-6" cy="18" rx="7" ry="5.5" transform="rotate(-15, -6, 18)"/>
+    <ellipse cx="14" cy="14" rx="7" ry="5.5" transform="rotate(-15, 14, 14)"/>
+    <rect x="-1" y="-12" width="3" height="30" rx="1"/>
+    <rect x="19" y="-16" width="3" height="30" rx="1"/>
+    <rect x="-1" y="-14" width="23" height="4" rx="2"/>
+  </g>
+
+  <!-- "iPod" text on screen -->
+  <text x="128" y="104" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" font-weight="bold" fill="white" opacity="0.8">iPod Manager</text>
+
+  <!-- Click wheel outer -->
+  <circle cx="128" cy="176" r="52" fill="#d4d4d4" stroke="#bbb" stroke-width="2"/>
+
+  <!-- Click wheel grooves (subtle) -->
+  <circle cx="128" cy="176" r="52" fill="none" stroke="#c8c8c8" stroke-width="0.5"/>
+  <circle cx="128" cy="176" r="44" fill="none" stroke="#c8c8c8" stroke-width="0.3"/>
+  <circle cx="128" cy="176" r="36" fill="none" stroke="#c8c8c8" stroke-width="0.3"/>
+
+  <!-- Center button -->
+  <circle cx="128" cy="176" r="20" fill="#e0e0e0" stroke="#c0c0c0" stroke-width="1.5"/>
+
+  <!-- Click wheel labels -->
+  <text x="128" y="133" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="bold" fill="#666">MENU</text>
+
+  <!-- Forward/back triangles -->
+  <polygon points="163,176 172,170 172,182" fill="#777"/>
+  <polygon points="84,176 93,170 93,182" fill="#777" transform="rotate(180, 88.5, 176)"/>
+
+  <!-- Play/pause at bottom -->
+  <g transform="translate(128, 218)" fill="#777">
+    <polygon points="-8,-5 -2,-1 -8,3" />
+    <rect x="0" y="-4" width="2.5" height="8" rx="0.5"/>
+    <rect x="4.5" y="-4" width="2.5" height="8" rx="0.5"/>
+  </g>
+</svg>

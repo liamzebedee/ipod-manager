@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=iPod Manager
+Comment=GTK4 music manager for iPod Classic
+Exec=/usr/bin/python3 /home/liam/Music/ipod-manager/ipod_manager.py
+Icon=/home/liam/Music/ipod-manager/ipod-manager.svg
+Terminal=false
+Type=Application
+Categories=Audio;Music;GTK;
+Keywords=ipod;music;sync;
+StartupWMClass=ipod-manager
